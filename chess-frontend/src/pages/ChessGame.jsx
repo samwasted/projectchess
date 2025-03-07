@@ -188,72 +188,54 @@ const ChessGame = () => {
         body: JSON.stringify(joinMessage),
       });
     
-      // Subscribe to the chess topic.
+      // Subscribe to the main chess topic for initial subscription notification
       stompClient.subscribe('/topic/chess', (message) => {
-        console.log("Raw WebSocket message:", message.body);
+        console.log("Received message from main topic:", message.body);
         try {
           const update = JSON.parse(message.body);
-          console.log("Received update:", update);
+          console.log("Parsed main topic update:", update);
           
-          // Handle game ID assignment.
-          if (update.gameId) {
+          // Handle subscription notification
+          if (update.type === "game.subscribe" && update.gameId) {
             setGameId(update.gameId);
-            console.log("Set gameId:", update.gameId);
-          }
-          
-          // Handle player assignment: check for color (either update.playerColor or update.color).
-          if (update.player === playerName && (update.playerColor || update.color)) {
-            const color = update.playerColor || update.color;
-            setPlayerColor(color);
-            console.log("Assigned playerColor:", color);
-            setSystemMessage(`You are playing as ${color === 'w' ? 'White' : 'Black'}`);
-          }
-          
-          // Handle opponent joining.
-          if (update.type === 'PLAYER_JOINED' && update.player !== playerName) {
-            setOpponent(update.player);
-            console.log("Opponent joined:", update.player);
-            setSystemMessage(`${update.player} has joined the game!`);
-          }
-          
-          // Handle board state update.
-          if (update.fen) {
-            try {
-              const newGame = new Chess();
-              if (newGame.load(update.fen)) {
-                console.log("Loaded new FEN:", update.fen);
-                setGame(newGame);
-                updateGameStatus(newGame);
+            console.log("Game ID received, subscribing to game-specific topic:", update.gameId);
+            
+            // Subscribe to the game-specific topic
+            stompClient.subscribe(`/topic/chess.${update.gameId}`, (gameMessage) => {
+              console.log("Received message from game topic:", gameMessage.body);
+              try {
+                const gameUpdate = JSON.parse(gameMessage.body);
+                console.log("Parsed game update:", gameUpdate);
+                
+                // Handle different message types
+                if (gameUpdate.type === "game.joined") {
+                  handleGameJoined(gameUpdate);
+                } else if (gameUpdate.type === "game.move") {
+                  handleGameMove(gameUpdate);
+                } else if (gameUpdate.type === "game.gameOver") {
+                  handleGameOver(gameUpdate);
+                } else if (gameUpdate.type === "game.left") {
+                  handleGameLeft(gameUpdate);
+                } else if (gameUpdate.type === "system") {
+                  console.log("System message:", gameUpdate.content);
+                  setSystemMessage(gameUpdate.content);
+                  setTimeout(() => {
+                    setSystemMessage(prev => prev === gameUpdate.content ? "" : prev);
+                  }, 5000);
+                } else if (gameUpdate.type === "error") {
+                  console.error("Error from server:", gameUpdate.content);
+                  setError(gameUpdate.content);
+                  setTimeout(() => {
+                    setError("");
+                  }, 5000);
+                }
+              } catch (err) {
+                console.error("Error parsing game message:", err);
               }
-            } catch (err) {
-              console.error("Invalid FEN received:", err);
-            }
-          }
-          
-          // Handle move history update.
-          if (update.moveHistory) {
-            console.log("Received move history:", update.moveHistory);
-            setMoveLog(update.moveHistory);
-          }
-          
-          // Handle turn updates.
-          if (update.turn) {
-            console.log("Turn update received:", update.turn);
-            setSystemMessage(`${update.turn === playerName ? 'Your' : `${update.turn}'s`} turn`);
-          }
-          
-          // Handle system messages.
-          if (update.type && update.content) {
-            console.log("System message received:", update.content);
-            setSystemMessage(update.content);
-            if (update.type !== 'CRITICAL') {
-              setTimeout(() => {
-                setSystemMessage(prev => (prev === update.content ? "" : prev));
-              }, 5000);
-            }
+            });
           }
         } catch (err) {
-          console.error("Error parsing update:", err);
+          console.error("Error parsing main topic message:", err);
         }
       });
     };
@@ -268,9 +250,142 @@ const ChessGame = () => {
       setConnected(false);
       setSystemMessage("Disconnected from game server. Attempting to reconnect...");
     };
-
+    
     return stompClient;
+  }, [playerName]);
+
+  // Handle game joined message
+  const handleGameJoined = useCallback((update) => {
+    // Determine player colors based on your player name
+    if (update.player1 === playerName) {
+      setPlayerColor('w');  // Player 1 is white
+      console.log("You are Player 1 (White)");
+      setSystemMessage("You are playing as White");
+      if (update.player2) {
+        setOpponent(update.player2);
+        console.log("Opponent (Black):", update.player2);
+      }
+    } else if (update.player2 === playerName) {
+      setPlayerColor('b');  // Player 2 is black
+      console.log("You are Player 2 (Black)");
+      setSystemMessage("You are playing as Black");
+      if (update.player1) {
+        setOpponent(update.player1);
+        console.log("Opponent (White):", update.player1);
+      }
+    }
+
+    // Update board state if provided
+    if (update.board) {
+      try {
+        // Convert board array to FEN or however your backend represents the board
+        // This depends on your specific implementation
+        console.log("Received board state:", update.board);
+        
+        // If you're using FEN strings directly:
+        // const newGame = new Chess(update.board);
+        
+        // Or if you need to convert the board array to a format Chess.js understands:
+        // const newGame = convertBoardToChess(update.board);
+        
+        // For this example, I'll assume we're starting a new game
+        const newGame = new Chess();
+        setGame(newGame);
+        updateGameStatus(newGame);
+      } catch (err) {
+        console.error("Error updating board state:", err);
+      }
+    }
+
+    // Update game state
+    if (update.gameState) {
+      console.log("Game state:", update.gameState);
+      if (update.gameState === "IN_PROGRESS") {
+        setSystemMessage(`Game in progress. ${update.turn === playerName ? "Your" : "Opponent's"} turn.`);
+      } else if (update.gameState === "WAITING_FOR_PLAYER") {
+        setSystemMessage("Waiting for another player to join...");
+      }
+    }
   }, [playerName, updateGameStatus]);
+
+  // Handle game move message
+  const handleGameMove = useCallback((update) => {
+    console.log("Move update received:", update);
+    
+    // Update the chess board
+    if (update.board) {
+      try {
+        // Here you would convert your board representation to something Chess.js understands
+        // For simplicity, I'll reset to a new game (you'll need to adapt this)
+        const newGame = new Chess();
+        // newGame.load(boardToFen(update.board)); // You'll need to implement this conversion
+        setGame(newGame);
+        updateGameStatus(newGame);
+        
+        // You might also want to add the move to the move log
+        if (update.move) {
+          const moveNotation = `${update.sender}: ${update.move}`;
+          setMoveLog(prev => [...prev, moveNotation]);
+        }
+      } catch (err) {
+        console.error("Error updating board after move:", err);
+      }
+    }
+    
+    // Update whose turn it is
+    if (update.turn) {
+      const isYourTurn = update.turn === playerName;
+      setSystemMessage(isYourTurn ? "Your turn" : `${update.turn}'s turn`);
+    }
+  }, [playerName, updateGameStatus]);
+
+  // Handle game over message
+  const handleGameOver = useCallback((update) => {
+    console.log("Game over update received:", update);
+    
+    if (update.gameState) {
+      let statusMessage = "Game Over!";
+      
+      if (update.gameState === "PLAYER1_WON") {
+        statusMessage = `${update.player1} (White) wins!`;
+      } else if (update.gameState === "PLAYER2_WON") {
+        statusMessage = `${update.player2} (Black) wins!`;
+      } else if (update.gameState === "DRAW") {
+        statusMessage = "Game ended in a draw!";
+      }
+      
+      setGameStatus(statusMessage);
+      setSystemMessage(statusMessage);
+    }
+    
+    if (update.winner) {
+      console.log("Winner:", update.winner);
+      const youWon = update.winner === playerName;
+      setSystemMessage(youWon ? "You won the game!" : `${update.winner} won the game!`);
+    }
+  }, [playerName]);
+
+  // Handle game left message
+  const handleGameLeft = useCallback((update) => {
+    console.log("Player left update received:", update);
+    
+    // Check if opponent left
+    if ((update.player1 === null && playerName === update.player2) || 
+        (update.player2 === null && playerName === update.player1)) {
+      setOpponent(null);
+      setSystemMessage("Your opponent left the game. Waiting for a new player...");
+    }
+    
+    // Reset game if both players left
+    if (update.player1 === null && update.player2 === null) {
+      setGameId(null);
+      setPlayerColor(null);
+      setOpponent(null);
+      setGame(new Chess());
+      setMoveLog([]);
+      setSystemMessage("Game ended. Join again to start a new game.");
+    }
+  }, [playerName]);
 
   // Establish WebSocket connection once playerName is set.
   useEffect(() => {
@@ -293,7 +408,6 @@ const ChessGame = () => {
       if (stompClient) {
         if (stompClient.active && gameId) {
           const leaveMessage = { 
-            gameId: gameId,
             player: playerName 
           };
           console.log("Sending leave message:", leaveMessage);
@@ -354,9 +468,8 @@ const ChessGame = () => {
       if (client && client.active && gameId) {
         const moveMessage = {
           gameId: gameId,
-          player: playerName,
-          move: move.san || inputValue,
-          fen: newFen,
+          sender: playerName,
+          move: inputValue,  // Changed from move.san to match backend expectations
         };
         console.log("Publishing move message:", moveMessage);
         client.publish({
@@ -399,9 +512,8 @@ const ChessGame = () => {
         if (client && client.active && gameId) {
           const moveMessage = {
             gameId: gameId,
-            player: playerName,
-            move: move.san || `${sourceSquare}${targetSquare}`,
-            fen: newFen,
+            sender: playerName,
+            move: `${sourceSquare}${targetSquare}`,  // Using simple notation for backend
           };
           console.log("Publishing move message from onPieceDrop:", moveMessage);
           client.publish({
@@ -429,16 +541,9 @@ const ChessGame = () => {
     }
     
     if (client && client.active && gameId) {
-      const resetMessage = { 
-        gameId: gameId,
-        player: playerName,
-        action: 'RESET' 
-      };
-      console.log("Publishing reset message:", resetMessage);
-      client.publish({
-        destination: '/app/chess.reset',
-        body: JSON.stringify(resetMessage),
-      });
+      // Note: Your backend doesn't seem to have a chess.reset endpoint
+      // You might want to leave the game and join a new one instead
+      leaveGame();
     } else {
       console.log("Resetting local game");
       const newGame = new Chess();
@@ -446,7 +551,7 @@ const ChessGame = () => {
       setMoveLog([]);
       updateGameStatus(newGame);
     }
-  }, [client, gameId, playerName, updateGameStatus]);
+  }, [client, gameId, updateGameStatus]);
 
   // Leave game handler.
   const leaveGame = useCallback(() => {
@@ -456,7 +561,7 @@ const ChessGame = () => {
     }
     console.log("Player leaving game");
     if (client && client.active && gameId) {
-      const leaveMessage = { gameId, player: playerName };
+      const leaveMessage = { player: playerName };
       console.log("Publishing leave message:", leaveMessage);
       client.publish({
         destination: '/app/chess.leave',

@@ -16,7 +16,7 @@ import org.springframework.messaging.simp.stomp.StompHeaderAccessor;
 import org.springframework.stereotype.Controller;
 import org.springframework.web.socket.messaging.SessionDisconnectEvent;
 
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.logging.Logger;
 
 /**
  * Controller class for handling WebSocket messages and managing multiplayer Chess games.
@@ -32,8 +32,9 @@ public class MessageController {
     @Autowired
     private SimpMessagingTemplate messagingTemplate;
 
-    private final ChessManager chessManager = new ChessManager();
-    private final ReentrantLock managerLock = new ReentrantLock();
+    @Autowired
+    private ChessManager chessManager;
+
 
     /**
      * Handles a request from a client to join a Chess game.
@@ -46,32 +47,45 @@ public class MessageController {
             return;
         }
 
-        ChessGame game;
-        managerLock.lock();
-        try {
-            game = chessManager.joinGame(message.getPlayer());
-        } finally {
-            managerLock.unlock();
+        // Check if player is already in a game to prevent double-joins
+        String player = message.getPlayer();
+        ChessGame game = null;
+
+        synchronized (chessManager) {
+            // Check if player is already in any game
+            boolean playerAlreadyInGame = chessManager.isPlayerInAnyGame(player);
+
+            // Only join if not already in a game
+            if (!playerAlreadyInGame) {
+                game = chessManager.joinGame(player);
+
+                if (game == null) {
+                    sendErrorMessage("Unable to join the chess game. The game might be full or an internal error occurred.", null);
+                    return;
+                }
+
+                headerAccessor.getSessionAttributes().put("gameId", game.getGameId());
+                headerAccessor.getSessionAttributes().put("player", player);
+            } else {
+                sendErrorMessage("You are already in a game.", null);
+                return;
+            }
         }
 
-        if (game == null) {
-            sendErrorMessage("Unable to join the chess game. The game might be full or an internal error occurred.", null);
-            return;
-        }
-
-        headerAccessor.getSessionAttributes().put("gameId", game.getGameId());
-        headerAccessor.getSessionAttributes().put("player", message.getPlayer());
-
-        // Broadcast join message.
+        // Send joined message with player information included
         ChessMessage joinMsg = gameToMessage(game);
         joinMsg.setType("game.joined");
+        joinMsg.setContent(player + " has joined the game.");
         messagingTemplate.convertAndSend("/topic/chess." + game.getGameId(), joinMsg);
 
-        // Broadcast system message.
-        ChessMessage systemMsg = new ChessMessage();
-        systemMsg.setType("system");
-        systemMsg.setContent(message.getPlayer() + " has joined the game.");
-        messagingTemplate.convertAndSend("/topic/chess." + game.getGameId(), systemMsg);
+        // Only send subscription notification if actually needed
+        if (game.getGameState() == GameState.WAITING_FOR_PLAYER) {
+            ChessMessage subscribeMsg = new ChessMessage();
+            subscribeMsg.setType("game.subscribe");
+            subscribeMsg.setGameId(game.getGameId());
+            subscribeMsg.setContent("Please subscribe to game-specific topic");
+            messagingTemplate.convertAndSend("/topic/chess", subscribeMsg);
+        }
     }
 
     /**
@@ -86,23 +100,15 @@ public class MessageController {
         }
 
         ChessGame game;
-        managerLock.lock();
-        try {
+        synchronized (chessManager) {
             game = chessManager.leaveGame(message.getPlayer());
-        } finally {
-            managerLock.unlock();
         }
 
         if (game != null) {
-            // Broadcast system message for leaving.
-            ChessMessage systemMsg = new ChessMessage();
-            systemMsg.setType("system");
-            systemMsg.setContent(message.getPlayer() + " has left the game.");
-            messagingTemplate.convertAndSend("/topic/chess." + game.getGameId(), systemMsg);
-
-            // Broadcast updated game state.
+            // Broadcast combined leave message with game state
             ChessMessage gameMessage = gameToMessage(game);
             gameMessage.setType("game.left");
+            gameMessage.setContent(message.getPlayer() + " has left the game.");
             messagingTemplate.convertAndSend("/topic/chess." + game.getGameId(), gameMessage);
         }
     }
@@ -124,45 +130,34 @@ public class MessageController {
         String moveNotation = message.getMove(); // e.g., "e2e4"
 
         ChessGame game;
-        managerLock.lock();
-        try {
+        synchronized (chessManager) {
             game = chessManager.getGame(gameId);
-        } finally {
-            managerLock.unlock();
-        }
 
-        if (game == null || game.isGameOver()) {
-            sendErrorMessage("Game not found or is already over.", gameId);
-            return;
-        }
+            if (game == null || game.isGameOver()) {
+                sendErrorMessage("Game not found or is already over.", gameId);
+                return;
+            }
 
-        if (game.getGameState().equals(GameState.WAITING_FOR_PLAYER)) {
-            sendErrorMessage("Game is waiting for another player to join.", gameId);
-            return;
-        }
+            if (game.getGameState().equals(GameState.WAITING_FOR_PLAYER)) {
+                sendErrorMessage("Game is waiting for another player to join.", gameId);
+                return;
+            }
 
-        // Verify that the player is part of the game
-        if (!isPlayerInGame(player, game)) {
-            sendErrorMessage("You are not a participant in this game.", gameId);
-            return;
-        }
+            // Verify that the player is part of the game
+            if (!isPlayerInGame(player, game)) {
+                sendErrorMessage("You are not a participant in this game.", gameId);
+                return;
+            }
 
-        if (!game.getTurn().equals(player)) {
-            sendErrorMessage("It's not your turn.", gameId);
-            return;
-        }
+            if (!game.getTurn().equals(player)) {
+                sendErrorMessage("It's not your turn.", gameId);
+                return;
+            }
 
-        boolean moveSuccess;
-        managerLock.lock();
-        try {
-            moveSuccess = game.makeMove(player, moveNotation);
-        } finally {
-            managerLock.unlock();
-        }
-
-        if (!moveSuccess) {
-            sendErrorMessage("Invalid move. Please try again.", gameId);
-            return;
+            if (!game.makeMove(player, moveNotation)) {
+                sendErrorMessage("Invalid move. Please try again.", gameId);
+                return;
+            }
         }
 
         ChessMessage gameStateMessage = gameToMessage(game);
@@ -178,11 +173,8 @@ public class MessageController {
             new Thread(() -> {
                 try {
                     Thread.sleep(500); // Small delay to ensure message delivery
-                    managerLock.lock();
-                    try {
+                    synchronized (chessManager) {
                         chessManager.removeGame(gameId);
-                    } finally {
-                        managerLock.unlock();
                     }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -211,18 +203,11 @@ public class MessageController {
         ChessGame game;
         boolean shouldRemoveGame = false;
 
-        managerLock.lock();
-        try {
+        synchronized (chessManager) {
             game = chessManager.getGame(gameId);
             if (game == null) {
                 return;
             }
-
-            // Broadcast system message for disconnection.
-            ChessMessage disconnectMsg = new ChessMessage();
-            disconnectMsg.setType("system");
-            disconnectMsg.setContent(player + " has disconnected.");
-            messagingTemplate.convertAndSend("/topic/chess." + gameId, disconnectMsg);
 
             if (game.getPlayer1() != null && game.getPlayer1().equals(player)) {
                 game.setPlayer1(null);
@@ -246,23 +231,20 @@ public class MessageController {
                 chessManager.removeGame(gameId);
                 return;
             }
-        } finally {
-            managerLock.unlock();
         }
 
+        // Create combined disconnection and game over message
         ChessMessage gameMessage = gameToMessage(game);
         gameMessage.setType("game.gameOver");
+        gameMessage.setContent(player + " has disconnected.");
         messagingTemplate.convertAndSend("/topic/chess." + gameId, gameMessage);
 
         // Add delay before removing the game
         new Thread(() -> {
             try {
                 Thread.sleep(500); // Small delay to ensure message delivery
-                managerLock.lock();
-                try {
+                synchronized (chessManager) {
                     chessManager.removeGame(gameId);
-                } finally {
-                    managerLock.unlock();
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();

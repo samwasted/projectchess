@@ -230,4 +230,25 @@ public class ChessManager {
 
         logger.info("Cleaned up stale entries. Games remaining: " + games.size() + ", Waiting players: " + waitingPlayers.size());
     }
+    /**
+     * Checks if a player is currently in any game.
+     *
+     * @param player the player's name
+     * @return true if the player is in a game, false otherwise
+     */
+    public synchronized boolean isPlayerInAnyGame(String player) {
+        if (player == null || player.trim().isEmpty()) {
+            return false;
+        }
+
+        // First check if player is in waiting players map
+        if (waitingPlayers.containsKey(player)) {
+            return true;
+        }
+
+        // Search through all games
+        return games.values().stream()
+                .anyMatch(game -> (game.getPlayer1() != null && game.getPlayer1().equals(player)) ||
+                        (game.getPlayer2() != null && game.getPlayer2().equals(player)));
+    }
 }
